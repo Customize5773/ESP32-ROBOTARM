@@ -1,0 +1,77 @@
+// Copy this file to config.h and fill in your own values.
+// config.h is gitignored on purpose — it holds WiFi/broker credentials.
+#pragma once
+
+// ---------------------------------------------------------------------------
+// WiFi
+// ---------------------------------------------------------------------------
+#define WIFI_SSID     "your-wifi-ssid"
+#define WIFI_PASSWORD "your-wifi-password"
+
+// ---------------------------------------------------------------------------
+// MQTT broker — must match Innowork-dashboard-app-v1/config/services.php
+// ("mqtt" block) / your .env (MQTT_HOST, MQTT_PORT, MQTT_BASE_TOPIC), since
+// the Laravel backend and this firmware must agree on the same broker and
+// topic prefix to talk to each other.
+// ---------------------------------------------------------------------------
+#define MQTT_HOST        "192.168.1.100" // broker IP/hostname, e.g. Mosquitto/EMQX
+#define MQTT_PORT        1883
+#define MQTT_USERNAME    ""              // leave empty if broker allows anonymous
+#define MQTT_PASSWORD    ""
+#define MQTT_CLIENT_ID   "esp32-armrobot"
+#define MQTT_BASE_TOPIC  "arm"           // topics become "arm/command", "arm/status"
+
+// ---------------------------------------------------------------------------
+// Stepper pin mapping — BCN3D Moveo standard: 5x NEMA17 + A4988/DRV8825
+// drivers (STEP/DIR/ENABLE per axis, common VMOT power rail wired on the
+// driver board itself, not through the ESP32). Pins chosen to avoid ESP32
+// strapping pins (0, 2, 12, 15) and input-only pins (34-39).
+//
+// joint_angles[] index -> axis, matching TargetZonePreset::joint_angles in
+// the Laravel backend (6 elements: 5 stepper joints + 1 gripper servo).
+// ---------------------------------------------------------------------------
+#define AXIS_COUNT 5
+
+// index 0: base (waist rotation)
+#define BASE_STEP_PIN 25
+#define BASE_DIR_PIN  26
+#define BASE_EN_PIN   27
+
+// index 1: shoulder
+#define SHOULDER_STEP_PIN 14
+#define SHOULDER_DIR_PIN  13
+#define SHOULDER_EN_PIN   16
+
+// index 2: elbow
+#define ELBOW_STEP_PIN 17
+#define ELBOW_DIR_PIN  18
+#define ELBOW_EN_PIN   19
+
+// index 3: wrist roll
+#define WRIST_ROLL_STEP_PIN 21
+#define WRIST_ROLL_DIR_PIN  22
+#define WRIST_ROLL_EN_PIN   23
+
+// index 4: wrist pitch
+#define WRIST_PITCH_STEP_PIN 32
+#define WRIST_PITCH_DIR_PIN  33
+#define WRIST_PITCH_EN_PIN   4
+
+// ---------------------------------------------------------------------------
+// Gripper servo (SG90/MG90S) — joint_angles[5]
+// ---------------------------------------------------------------------------
+#define GRIPPER_SERVO_PIN 5
+
+// ---------------------------------------------------------------------------
+// Motion tuning. STEPS_PER_DEGREE = (motor_steps_per_rev * microstepping *
+// gear_ratio) / 360. Defaults below assume a 1.8 deg/step NEMA17 (200
+// steps/rev), 1/16 microstepping on the driver, and 1:1 gearing (no
+// reduction) — adjust per axis once your gearbox/pulley ratios are known.
+// ---------------------------------------------------------------------------
+#define DEFAULT_STEPS_PER_DEGREE ((200.0f * 16.0f) / 360.0f) // = 8.888... steps/deg
+
+#define MAX_SPEED_STEPS_PER_SEC 800.0f
+#define ACCELERATION_STEPS_PER_SEC2 400.0f
+
+// Heartbeat/telemetry publish interval while idle (milliseconds).
+#define STATUS_HEARTBEAT_MS 2000
