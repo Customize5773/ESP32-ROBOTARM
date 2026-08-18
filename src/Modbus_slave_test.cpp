@@ -2,6 +2,8 @@
 // Minimal Modbus RTU slave for ESP32 + MAX485
 // Slave ID = 1, Function 03 (Read Holding Registers) supported
 
+#include <Arduino.h>
+
 #define RXD2 16
 #define TXD2 17
 #define DE_RE_PIN 4      // tied DE+RE on MAX485
@@ -13,6 +15,10 @@ uint16_t holdingRegisters[10] = {1234, 5678, 100, 200, 300, 400, 500, 600, 700, 
 uint8_t buf[256];
 uint8_t bufLen = 0;
 unsigned long lastByteTime = 0;
+
+void processFrame();
+void sendException(uint8_t function, uint8_t code);
+void sendResponse(uint8_t *data, uint8_t len);
 
 uint16_t modbusCRC16(uint8_t *data, uint8_t len) {
   uint16_t crc = 0xFFFF;
