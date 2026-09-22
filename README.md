@@ -33,6 +33,11 @@ git commit -m "feat: firmware ESP32 arm robot (stepper + servo, MQTT)"
 git push
 ```
 
+## Uji software sebelum hardware
+
+Lihat [panduan integrasi dan simulator MQTT](INTEGRATION-QUICKSTART.md) untuk
+menguji perintah web/mobile serta feedback robot tanpa motor terhubung.
+
 ## Wiring
 
 | Axis          | Driver | STEP pin | DIR pin | ENABLE pin |
