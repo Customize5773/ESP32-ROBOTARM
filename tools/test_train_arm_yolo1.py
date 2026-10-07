@@ -11,6 +11,7 @@ import hashlib
 import io
 import json
 from pathlib import Path
+import queue
 import shutil
 import tempfile
 import types
@@ -40,6 +41,7 @@ def module(cell):
 RUNTIME = module('runtime-module')
 QUALITY = module('quality-module')
 MAPPING = module('mapping-module')
+STAGES = module('stage-module')
 DATA = dict(Path=Path, hashlib=hashlib, zipfile=zipfile, yaml=yaml,
             np=np, cv2=cv2, Counter=Counter, warnings=warnings, shutil=shutil, json=json)
 tree = ast.parse(CELLS['dataset'])
@@ -224,12 +226,13 @@ class NotebookTests(unittest.TestCase):
             for filename in ('best.pt', 'best.onnx', 'runtime_config.json'):
                 (evaluation/filename).write_text('{}')
             (evaluation/'onnx_quality.json').write_text('{"test": "fixture"}')
-            for filename in ('icam_color_runtime.py', 'robot_mapping.py', 'arm_quality.py'):
+            for filename in ('icam_color_runtime.py', 'robot_mapping.py', 'arm_quality.py', 'stage_coordinator.py'):
                 (root/filename).write_text('# fixture')
             scope = dict(ARTIFACT_ROOT=artifacts, EVAL_DIR=evaluation, ROOT=root, RUN_ID='test_run',
                          BEST_PT=evaluation/'best.pt', ONNX_PATH=evaluation/'best.onnx',
                          NAMES={0:'GREEN',1:'YELLOW',2:'RED'}, ROBOT_MAPPING={'firmware':'SmoothingPitch.ino'},
                          CALIBRATION={'points_px':None}, calibration=None, REPORT={'coverage':{}},
+                         STAGE_PROTOCOL={'tcp_adapter_connected':False},
                          THRESHOLD_REPORT={'precision_target_met':True}, DATASET_SHA256='fixture',
                          MERGE_MANIFEST={'sources':[dict(source_id='source_01', zip_name='old.zip',
                              sha256='fixture', id_remap={0:0,1:1,2:2}, attribution={})]},
@@ -346,6 +349,168 @@ class MergeTests(unittest.TestCase):
             self.assertEqual([p.name for p in paths], ['old.zip','new (1).zip'])
             with self.assertRaisesRegex(ValueError, 'dipilih dua kali'):
                 SOURCE['resolve_dataset_zips'](root,root/'drive',['old.zip','old.zip'])
+
+    def test_resolve_repairs_escaped_dot_in_bare_zip_name(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            filename = 'arm_pasti_3_new.v1i.yolov11.zip'
+            mini_dataset(root/filename, ['GREEN','RED','YELLOW'], 10)
+            paths = SOURCE['resolve_dataset_zips'](
+                root, root/'drive', [r'arm_pasti_3_new\.v1i.yolov11.zip'], allow_upload=False)
+            self.assertEqual(paths, [(root/filename).resolve()])
+
+    def test_upload_none_automatically_uses_colab_for_missing_zip(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            mini_dataset(root/'old.zip', ['HIJAU','KUNING','MERAH'], 11)
+            calls = []
+            def upload(**kwargs):
+                calls.append(kwargs)
+                mini_dataset(root/'new (1).zip', ['GREEN','RED','YELLOW'], 12)
+                return {'new (1).zip':b'uploaded'}
+            google = types.ModuleType('google')
+            colab = types.ModuleType('google.colab')
+            colab.files = types.SimpleNamespace(upload=upload)
+            google.colab = colab
+            with patch.dict('sys.modules', {'google':google, 'google.colab':colab}), \
+                 patch.dict(SOURCE, {'IN_COLAB':False}):
+                paths = SOURCE['resolve_dataset_zips'](root,root/'drive',['old.zip','new.zip'],upload=None)
+            self.assertEqual([p.name for p in paths], ['old.zip','new (1).zip'])
+            self.assertEqual(calls, [{'target_dir':str(root)}])
+
+    def test_missing_zip_diagnostics_and_explicit_upload_disabled(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            mini_dataset(root/'available.zip', ['GREEN','RED','YELLOW'], 13)
+            def unexpected_upload(**kwargs):
+                self.fail('Upload must be disabled')
+            with self.assertRaises(FileNotFoundError) as caught:
+                SOURCE['resolve_dataset_zips'](root,root/'drive',['missing.zip'],
+                                               upload=unexpected_upload, allow_upload=False)
+            message = str(caught.exception)
+            self.assertIn(str(root/'missing.zip'),message)
+            self.assertIn(str(root/'drive/datasets/missing.zip'),message)
+            self.assertIn(str(root/'available.zip'),message)
+
+
+
+
+class StageTests(unittest.TestCase):
+    def setUp(self):
+        self.now = 100.0
+        self.gate = STAGES.StageCoordinator(clock=lambda:self.now, timeout=10.)
+        self.detection = dict(color='RED', confidence=.99, xy_mm=[10.,550.],
+                              inside_work_area=True, center_inside_mask=True)
+
+    def start(self):
+        self.assertTrue(self.gate.on_status({'event':'READY','home':True}))
+        self.now += 1
+        payload = self.gate.offer([self.detection], self.now)
+        self.assertIsNotNone(payload)
+        return payload
+
+    def test_initial_home_required_and_lock_precedes_ack(self):
+        self.assertIsNone(self.gate.offer([self.detection],self.now))
+        self.assertFalse(self.gate.on_status({'event':'READY','home':False}))
+        payload = self.start()
+        self.assertEqual([payload[k] for k in ('G','R','Y')],[0,1,0])
+        self.assertEqual(self.gate.state,'WAIT_ACCEPTED')
+        self.assertIsNone(self.gate.offer([dict(self.detection,color='GREEN')],self.now))
+        self.assertFalse(self.gate.on_status('OK'))
+        self.assertEqual(self.gate.state,'WAIT_ACCEPTED')
+        payload['x'] = -123
+        self.detection['xy_mm'][0] = -456
+        self.assertEqual(self.gate.active['x'],10.)
+
+    def test_stage_finishes_only_at_home_then_new_frame_no_queue(self):
+        first = self.start()
+        self.assertTrue(self.gate.on_status({'event':'ACCEPTED','stage_id':first['stage_id']}))
+        self.now += 1
+        pending_frame = self.now
+        another = dict(self.detection,color='GREEN')
+        self.assertIsNone(self.gate.offer([another],pending_frame))
+        self.assertFalse(self.gate.on_status({'event':'READY','home':True}))
+        self.assertFalse(self.gate.on_status({'event':'DONE','stage_id':'another_stage','home':True}))
+        self.assertEqual(self.gate.state,'BUSY')
+        self.now += 1
+        self.assertTrue(self.gate.on_status({'event':'DONE','stage_id':first['stage_id'],'home':True}))
+        self.assertIsNone(self.gate.active)
+        self.assertIsNone(self.gate.offer([another],pending_frame))
+        self.assertIsNone(self.gate.offer([another],self.now))
+        self.now += .1
+        second = self.gate.offer([another],self.now)
+        self.assertNotEqual(second['stage_id'],first['stage_id'])
+        self.assertEqual([second[k] for k in ('G','R','Y')],[1,0,0])
+
+    def test_done_without_home_or_acceptance_faults(self):
+        for accepted, home in [(True,False),(False,True)]:
+            self.setUp()
+            first = self.start()
+            if accepted:
+                self.gate.on_status({'event':'ACCEPTED','stage_id':first['stage_id']})
+            self.assertFalse(self.gate.on_status({'event':'DONE','stage_id':first['stage_id'],'home':home}))
+            self.assertEqual(self.gate.state,'FAULT')
+            self.assertIsNone(self.gate.offer([self.detection],self.now))
+
+    def test_timeout_reset_error_and_disconnect_never_retry(self):
+        for failure in ('timeout','reset','error','disconnect'):
+            self.setUp()
+            first = self.start()
+            if failure == 'timeout':
+                self.now += 10
+                self.gate.tick()
+            elif failure == 'reset':
+                self.gate.on_status({'event':'RESET'})
+            elif failure == 'error':
+                self.gate.on_status({'event':'ERROR','stage_id':first['stage_id'],'reason':'grip failed'})
+            else:
+                self.gate.fail('TCP connection lost')
+            self.assertEqual(self.gate.state,'FAULT')
+            self.assertFalse(self.gate.on_status({'event':'READY','home':True}))
+            self.assertFalse(self.gate.on_status({'event':'DONE','stage_id':first['stage_id'],'home':True}))
+            self.assertIsNone(self.gate.offer([self.detection],self.now))
+            self.assertEqual(self.gate.active,first)
+
+    def test_selection_requires_fresh_frame_valid_mat_and_color(self):
+        self.gate.on_status({'event':'READY','home':True})
+        self.now += 2
+        for stamp in (100.,100.1,103.,float('nan')):
+            self.assertIsNone(self.gate.offer([self.detection],stamp))
+        bad = [
+            dict(self.detection,inside_work_area=False),
+            dict(self.detection,center_inside_mask=False),
+            dict(self.detection,color='MAT'),
+            dict(self.detection,confidence=.1),
+            dict(self.detection,xy_mm=[float('inf'),10.]),
+        ]
+        self.assertIsNone(self.gate.offer(bad,self.now))
+        good = dict(self.detection,color='YELLOW',confidence=.9)
+        winner = self.gate.offer([good,self.detection],self.now)
+        self.assertEqual(winner['R'],1)
+
+    def test_camera_rejects_queued_frames_from_before_done(self):
+        camera = RUNTIME.CamNaviSource.__new__(RUNTIME.CamNaviSource)
+        camera.frames = queue.Queue()
+        camera.frames.put((99.8,np.zeros((2,2,3),np.uint8)))
+        camera.frames.put((99.95,np.ones((2,2,3),np.uint8)))
+        with patch.object(RUNTIME.time,'monotonic',return_value=100.):
+            stamp, frame = camera.read_sample(after=99.9)
+        self.assertEqual(stamp,99.95)
+        self.assertTrue(frame.all())
+
+    def test_camera_timestamp_is_not_refreshed_by_slow_decode(self):
+        camera = RUNTIME.CamNaviSource.__new__(RUNTIME.CamNaviSource)
+        camera.frames = queue.Queue(maxsize=1)
+        now = [99.8]
+        buffer = types.SimpleNamespace(get_size=lambda:1, extract_dup=lambda *a:b'0')
+        sample = types.SimpleNamespace(get_buffer=lambda:buffer)
+        def decode(*args):
+            now[0] = 100.2  # DONE could arrive while JPEG decoding is still in progress.
+            return np.ones((2,2,3),np.uint8)
+        with patch.object(RUNTIME.time,'monotonic',side_effect=lambda:now[0]), \
+             patch.object(RUNTIME.cv2,'imdecode',side_effect=decode):
+            camera._sample(sample)
+        self.assertEqual(camera.frames.get_nowait()[0],99.8)
 
 
 if __name__ == '__main__':
