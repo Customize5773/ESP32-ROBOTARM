@@ -5,15 +5,17 @@ Uses the same NumPy/OpenCV/ONNX/nbformat/PyYAML dependencies as the notebook.
 """
 import ast
 from collections import Counter
-from contextlib import redirect_stdout
+from contextlib import redirect_stdout, redirect_stderr
 from datetime import datetime, timezone
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import queue
 import shutil
 import tempfile
+import tarfile
 import types
 import unittest
 from unittest.mock import patch
@@ -61,6 +63,160 @@ def object_(cid=0, box=(0, 0, 10, 10), confidence=.9):
 
 
 class NotebookTests(unittest.TestCase):
+    def test_small_mode_recovers_fine_only_objects_and_preserves_nearby_objects(self):
+        yy,xx=np.indices((500,600))
+        frame=np.stack([xx,yy,np.zeros_like(xx)],axis=-1).astype(np.uint16)
+        roi=RUNTIME.MatROI(dict(frame_size_wh=[600,500],points_px=[[50,30],[550,30],[550,470],[50,470]]))
+        objects=[(0,(230,230,250,250)),(0,(260,230,280,250)),
+                 (1,(390,90,410,110)),(2,(110,370,130,390))]
+        def predict(crop,conf):
+            h,w=crop.shape[:2];x,y=map(int,crop[0,0,:2]);found=[]
+            for cid,b in objects:
+                # Controlled model: RED is only visible to the fine-scale pass.
+                if cid==2 and max(h,w)>128:continue
+                box=[max(0,b[0]-x),max(0,b[1]-y),min(w,b[2]-x),min(h,b[3]-y)]
+                if box[0]>=box[2] or box[1]>=box[3]:continue
+                found.append(dict(object_(cid,box),color={0:'GREEN',1:'YELLOW',2:'RED'}[cid],center_inside_mask=True))
+            return found
+        model=types.SimpleNamespace(predict=predict)
+        coarse=RUNTIME.predict_mat(model,frame,roi,mode='tiled',tile_size=256,overlap=.35)
+        info={}
+        small=RUNTIME.predict_mat(model,frame,roi,mode='small',tile_size=256,fine_tile_size=128,
+                                 overlap=.35,diagnostics=info)
+        self.assertEqual(len(coarse),3)
+        self.assertEqual(Counter(d['color'] for d in small),{'GREEN':2,'RED':1,'YELLOW':1})
+        self.assertEqual({tuple(d['center_px']) for d in small},{(240,240),(270,240),(400,100),(120,380)})
+        self.assertGreater(info['passes'],1)
+        self.assertLessEqual(info['passes'],64)
+
+    def test_tile_budget_rejects_plan_before_any_inference(self):
+        roi=RUNTIME.MatROI(dict(frame_size_wh=[640,480],points_px=[[10,10],[620,10],[620,460],[10,460]]))
+        calls=[];info={}
+        model=types.SimpleNamespace(predict=lambda *args:calls.append(args))
+        with self.assertRaisesRegex(ValueError,'max_passes'):
+            RUNTIME.predict_mat(model,np.zeros((480,640,3),np.uint8),roi,mode='small',
+                                tile_size=256,fine_tile_size=128,max_passes=2,diagnostics=info)
+        self.assertEqual(calls,[])
+        self.assertEqual(info['passes'],0)
+
+    def test_inference_sidecar_defaults_and_explicit_overrides(self):
+        options=dict(mode='small',tile_size=640,fine_tile_size=384,overlap=.35,max_passes=32)
+        self.assertEqual(RUNTIME.inference_settings(options),options)
+        self.assertEqual(RUNTIME.inference_settings(options,mode='roi-crop')['mode'],'roi-crop')
+        self.assertEqual(RUNTIME.inference_settings()['mode'],'roi-crop')
+        self.assertEqual(options['mode'],'small')
+        for invalid in [dict(options,fine_tile_size=640),dict(options,max_passes=0),
+                        dict(options,tile_size=True),dict(options,overlap='0.35'),dict(unknown=1)]:
+            with self.assertRaises(ValueError):RUNTIME.inference_settings(invalid)
+
+    def test_raw_photo_archive_reads_nested_tar_without_trusting_paths_or_generating_labels(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);buffer=io.BytesIO()
+            image=cv2.imencode('.png',np.zeros((20,30,3),np.uint8))[1].tobytes()
+            with tarfile.open(fileobj=buffer,mode='w:gz') as archive:
+                for name in ['../../escape.png','images/normal.png','labels/fake.txt']:
+                    data=image if name.endswith('.png') else b'untrusted text'
+                    member=tarfile.TarInfo(name);member.size=len(data)
+                    archive.addfile(member,io.BytesIO(data))
+            path=root/'photos.zip'
+            with zipfile.ZipFile(path,'w') as archive:archive.writestr('photos.tar.gz',buffer.getvalue())
+            found=QUALITY.extract_review_photos(path,root/'review')
+            self.assertEqual(len(found),2)
+            self.assertEqual(found[0]['frame_size_wh'],[30,20])
+            self.assertTrue(all(Path(r['path']).parent==root/'review' for r in found))
+            self.assertFalse((root/'escape.png').exists())
+            self.assertEqual(list((root/'review').glob('*.txt')),[])
+            with self.assertRaisesRegex(ValueError,'Batas|terlalu besar'):
+                QUALITY.extract_review_photos(path,root/'limited',max_bytes=1)
+
+    def test_retraining_a100_profile_reaches_trainer_and_persists_effective_args(self):
+        cuda = types.SimpleNamespace(is_available=lambda:True,
+            get_device_name=lambda device:'NVIDIA A100-SXM4-40GB',
+            get_device_properties=lambda device:types.SimpleNamespace(total_memory=40*1024**3))
+        config = ast.parse(CELLS['config'])
+        config.body = [node for node in config.body if not isinstance(node,(ast.Import,ast.ImportFrom))]
+        scope = dict(torch=types.SimpleNamespace(cuda=cuda), IN_COLAB=True,
+                     os=os, Path=Path, print=lambda *args:None)
+        exec(compile(config,'config','exec'),scope)
+        self.assertEqual((scope['RUN_MODE'],scope['IMGSZ'],scope['BATCH']),('train',640,32))
+        self.assertIsNone(scope['RESUME_CHECKPOINT'])
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            (root/'merge_manifest.json').write_text('{}')
+            calls=[]
+            class TrainerModel:
+                task='segment'
+                def __init__(self, path):
+                    self.callback=None
+                def add_callback(self, event, callback):
+                    self.callback=callback
+                def train(self, **kwargs):
+                    calls.append(kwargs)
+                    saved=root/kwargs['name']
+                    (saved/'weights').mkdir(parents=True)
+                    (saved/'weights'/'best.pt').write_bytes(b'fixture only, not real model')
+                    self.trainer=types.SimpleNamespace(save_dir=saved)
+                    self.callback(self.trainer)
+            scope.update(PERSIST=root,RUNS_ROOT=root,DATASET=root,DATA_YAML=root/'data.yaml',
+                         DATASET_SHA256='fixture',NAMES={0:'GREEN',1:'YELLOW',2:'RED'},
+                         YOLO=TrainerModel,REPORT={},json=json,shutil=shutil)
+            exec(CELLS['train'],scope)
+            args=calls[0]
+            self.assertEqual((args['imgsz'],args['batch'],args['epochs'],args['patience']), (640,32,200,40))
+            self.assertEqual((args['mosaic'],args['close_mosaic'],args['scale'],args['mask_ratio']),(.3,20,.35,2))
+            self.assertTrue(args['amp'])
+            self.assertEqual([args[k] for k in ['hsv_h','hsv_s','bgr','mixup','copy_paste']],[0]*5)
+            saved=json.loads((scope['EVAL_DIR']/'training_args.json').read_text())
+            self.assertEqual(saved,args)
+            context=json.loads((scope['RUN_DIR']/'run_context.json').read_text())
+            self.assertEqual(context['requested_profile'],'far_640')
+
+    def test_size_recall_matches_whole_scene_before_grouping_and_reports_absent_groups(self):
+        names={0:'GREEN',1:'YELLOW',2:'RED'}
+        # Native width 1280: a 64px bbox short side becomes 32px in the 640 reference.
+        small=object_(box=(0,0,64,64))
+        medium=object_(cid=1,box=(200,200,300,300))
+        predictions=[object_(box=(0,0,64,64)),object_(box=(0,0,64,64),confidence=.8),
+                     object_(cid=2,box=(200,200,300,300))]
+        records=[dict(image='scene',shape=(1280,1280,3),truths=[small,medium],predictions=predictions)]
+        report=QUALITY.recall_by_size(records,names,.6)
+        self.assertEqual(report['groups']['small_le32']['overall'],dict(tp=1,fn=0,objects=1,recall=1.))
+        self.assertEqual(report['groups']['medium_le96']['overall'],dict(tp=0,fn=1,objects=1,recall=0.))
+        self.assertIsNone(report['groups']['large_gt96']['overall']['recall'])
+        self.assertEqual(QUALITY.summarize(records,names,.6)['overall']['fp'],2)
+        # A missed small object remains in the denominator, not just detected objects.
+        records[0]['predictions']=[]
+        self.assertEqual(QUALITY.recall_by_size(records,names,.6)['groups']['small_le32']['overall']['fn'],1)
+
+    def test_baseline_comparison_uses_same_threshold_without_reselecting_weights(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            old,new=root/'old.onnx',root/'new.onnx'
+            old.write_bytes(b'old fixture'); new.write_bytes(b'new fixture')
+            names={0:'GREEN',1:'YELLOW',2:'RED'}
+            truth=object_()
+            def record(score):
+                return [dict(image='frame',shape=(640,640,3),truths=[truth],predictions=[object_(confidence=score)])]
+            scope=dict(BASELINE_ONNX=old,ONNX_PATH=new,EVAL_DIR=root,Path=Path,hashlib=hashlib,json=json,
+                       ColorModel=lambda path:types.SimpleNamespace(names=names,hw=(512,512)),
+                       detector=types.SimpleNamespace(names=names,hw=(640,640)),DATASET=root,
+                       DATASET_SHA256='same-test',NAMES=names,COMPARISON_CONF=.6,
+                       collect_predictions=lambda *args:(record(.55),{}),test_records=record(.65),test_timing={},
+                       summarize=QUALITY.summarize,recall_by_size=QUALITY.recall_by_size,
+                       MERGE_MANIFEST={'sources':[dict(source_id='source_02',zip_name='new.zip')],'records':[]},
+                       records_for_source=lambda records,*args:records,print=lambda *args:None)
+            exec(CELLS['baseline-comparison'],scope)
+            report=json.loads((root/'baseline_comparison.json').read_text())
+            self.assertEqual(report['baseline']['metrics']['overall']['overall']['tp'],0)
+            self.assertEqual(report['candidate']['metrics']['overall']['overall']['tp'],1)
+            self.assertEqual(report['confidence'],.6)
+            self.assertEqual(report['baseline']['input_hw'],[512,512])
+            self.assertEqual(report['candidate']['input_hw'],[640,640])
+            self.assertEqual(scope['ONNX_PATH'],new)
+            scope['BASELINE_ONNX']=None
+            exec(CELLS['baseline-comparison'],scope)
+            self.assertEqual(json.loads((root/'baseline_comparison.json').read_text())['status'],'not_configured')
+
     def test_schema_syntax_and_no_stale_output_or_motion(self):
         nbformat.validate(NOTEBOOK)
         self.assertEqual(len(CELLS), len(NOTEBOOK.cells))
@@ -141,7 +297,7 @@ class NotebookTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             MAPPING.RobotPlane(dict(config, points_px=[[0,0]]*4))
 
-    def test_runtime_marks_mat_area_without_removing_green_objects(self):
+    def test_runtime_restricts_mat_area_without_removing_green_objects(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             image_path = root/'scene.png'
@@ -153,19 +309,183 @@ class NotebookTests(unittest.TestCase):
             calibration_path.write_text(json.dumps(config))
             inside = dict(object_(box=(290,240,310,260)), color='GREEN', center_inside_mask=True)
             outside = dict(object_(box=(0,0,20,20)), color='GREEN', center_inside_mask=True)
-            detector = types.SimpleNamespace(predict=lambda *a:[dict(inside),dict(outside)])
-            argv = ['runtime', '--source', str(image_path), '--calibration', str(calibration_path)]
+            inference_inputs = []
+            def predict(frame, conf):
+                inference_inputs.append(frame.copy())
+                return [dict(inside),dict(outside)]
+            detector = types.SimpleNamespace(predict=predict)
+            argv = ['runtime', '--source', str(image_path), '--calibration', str(calibration_path),
+                    '--inference-mode', 'full']
             with patch('sys.argv', argv), patch.dict('sys.modules', {'robot_mapping':MAPPING}), \
                  patch.object(RUNTIME, 'ColorModel', return_value=detector), \
                  patch.object(RUNTIME.cv2, 'imwrite', return_value=True), redirect_stdout(io.StringIO()) as output:
                 RUNTIME.main()
             detections = json.loads(output.getvalue())['detections']
-            self.assertEqual(len(detections),2)
-            self.assertEqual([d['color'] for d in detections], ['GREEN','GREEN'])
+            self.assertEqual(len(detections),1)
+            self.assertEqual([d['color'] for d in detections], ['GREEN'])
             self.assertTrue(detections[0]['inside_work_area'])
-            self.assertFalse(detections[1]['inside_work_area'])
-            self.assertIsNone(detections[1]['xy_mm'])
+            self.assertTrue(detections[0]['inside_mat'])
+            self.assertTrue((inference_inputs[0][0,0] == 114).all())
+            self.assertTrue((inference_inputs[0][250,300] == 0).all())
             np.testing.assert_allclose(detections[0]['xy_mm'],[81.5,480],atol=.001)
+
+            # Machine-readable XY mode emits only the calibrated in-mat object.
+            with patch('sys.argv', argv+['--output','xy-json']), \
+                 patch.dict('sys.modules', {'robot_mapping':MAPPING}), \
+                 patch.object(RUNTIME, 'ColorModel', return_value=detector), \
+                 patch.object(RUNTIME.cv2, 'imwrite', return_value=True), redirect_stdout(io.StringIO()) as output:
+                RUNTIME.main()
+            self.assertTrue(output.getvalue().endswith('\n'))
+            lines = output.getvalue().splitlines()
+            self.assertEqual(len(lines),1)
+            self.assertEqual(json.loads(lines[0]),{'x':81.5,'y':480.,'G':1,'R':0,'Y':0})
+
+            # Pixel-only mat configuration does not require robot XY or plane Z.
+            roi_path = root/'mat_roi.json'
+            roi_path.write_text(json.dumps({k:config[k] for k in ('frame_size_wh','points_px')}))
+            argv = ['runtime','--source',str(image_path),'--roi',str(roi_path),'--inference-mode','full']
+            with patch('sys.argv', argv), patch.object(RUNTIME,'ColorModel',return_value=detector), \
+                 patch.object(RUNTIME.cv2,'imwrite',return_value=True), redirect_stdout(io.StringIO()) as output:
+                RUNTIME.main()
+            detections = json.loads(output.getvalue())['detections']
+            self.assertEqual(len(detections),1)
+            self.assertTrue(detections[0]['inside_mat'])
+            self.assertIsNone(detections[0]['inside_work_area'])
+            self.assertNotIn('xy_mm',detections[0])
+
+    def test_crop_restores_all_geometry_before_homography_without_mutation(self):
+        config = dict(frame_size_wh=[640,480], plane_z_mm=125,
+                      points_px=[[100,100],[500,100],[500,400],[100,400]],
+                      points_robot_xy_mm=[[10,410],[153,410],[153,550],[10,550]])
+        roi = RUNTIME.MatROI(config)
+        local = dict(object_(box=(190,140,210,160)), color='GREEN', center_inside_mask=True)
+        before = json.dumps(local)
+        inputs = []
+        def predict(frame, conf):
+            inputs.append(frame.shape)
+            return [local]
+        found = RUNTIME.predict_mat(types.SimpleNamespace(predict=predict),
+                                    np.zeros((480,640,3), np.uint8), roi)
+        self.assertEqual(inputs, [(301,401,3)])
+        self.assertEqual(found[0]['center_px'], [300,250])
+        self.assertEqual(found[0]['bbox_xyxy'], [290,240,310,260])
+        self.assertEqual(found[0]['contour'], [[290,240],[310,240],[310,260],[290,260]])
+        self.assertEqual(json.dumps(local), before)
+        np.testing.assert_allclose(MAPPING.RobotPlane(config).xy(found[0]['center_px'], (480,640,3)),
+                                   [81.5,480], atol=.001)
+
+    def test_tiles_merge_duplicates_and_reject_partial_instance_centers(self):
+        # Pixel channels encode original XY so the fake model can see its crop origin.
+        yy, xx = np.indices((240,320))
+        frame = np.stack([xx, yy, np.zeros_like(xx)], axis=-1).astype(np.uint16)
+        roi = RUNTIME.MatROI(dict(frame_size_wh=[320,240],
+                                 points_px=[[40,30],[280,30],[280,210],[40,210]]))
+        calls = []
+        def predict(crop, conf):
+            x, y = map(int, crop[0,0,:2])
+            h, w = crop.shape[:2]
+            calls.append((x,y,w,h))
+            # In several tiles this instance is clipped, giving a WRONG local centroid.
+            box = [max(0,140-x),max(0,110-y),min(w,160-x),min(h,130-y)]
+            if box[2] <= box[0] or box[3] <= box[1]:
+                return []
+            cut = box[0] == 0 or box[1] == 0 or box[2] == w or box[3] == h
+            return [dict(object_(box=box, confidence=.99 if cut else .8),
+                         color='GREEN', center_inside_mask=True)]
+        model = types.SimpleNamespace(predict=predict)
+        found = RUNTIME.predict_mat(model, frame, roi, mode='tiled', tile_size=128)
+        self.assertGreater(len(calls), 1)
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]['confidence'], .8)  # Never select confident clipped masks.
+        self.assertEqual(found[0]['center_px'], [150,120])
+        self.assertEqual(found[0]['bbox_xyxy'], [140,110,160,130])
+        self.assertTrue(all(x+w <= 281 and y+h <= 211 for x,y,w,h in calls))
+
+    def test_focused_modes_require_roi_and_validate_tile_parameters(self):
+        model = types.SimpleNamespace(predict=lambda frame, conf: [])
+        frame = np.zeros((100,100,3),np.uint8)
+        with self.assertRaisesRegex(ValueError,'poligon'):
+            RUNTIME.predict_mat(model,frame)
+        self.assertEqual(RUNTIME.predict_mat(model,frame,mode='full'), [])
+        for kwargs in [dict(tile_size=0),dict(tile_size=True),dict(overlap=float('nan')),
+                       dict(overlap=-.1),dict(overlap=1),dict(mode='unknown')]:
+            with self.assertRaises(ValueError):
+                RUNTIME.predict_mat(model,frame,**kwargs)
+
+    def test_cli_defaults_to_crop_and_maps_coordinates_to_original_pixels(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cv2.imwrite(str(root/'scene.png'),np.zeros((480,640,3),np.uint8))
+            (root/'roi.json').write_text(json.dumps(dict(frame_size_wh=[640,480],
+                points_px=[[100,100],[500,100],[500,400],[100,400]])))
+            local = dict(object_(box=(190,140,210,160)),color='RED',center_inside_mask=True)
+            shapes = []
+            def predict(frame, conf):
+                shapes.append(frame.shape)
+                return [local]
+            argv = ['runtime','--source',str(root/'scene.png'),'--roi',str(root/'roi.json')]
+            with patch('sys.argv',argv), patch.object(RUNTIME,'ColorModel',
+                    return_value=types.SimpleNamespace(predict=predict)), \
+                    patch.object(RUNTIME.cv2,'imwrite',return_value=True), redirect_stdout(io.StringIO()) as out:
+                RUNTIME.main()
+            result = json.loads(out.getvalue())
+            self.assertEqual(result['inference_mode'],'roi-crop')
+            self.assertEqual(shapes,[(301,401,3)])
+            self.assertEqual(result['detections'][0]['center_px'],[300,250])
+
+    def test_mat_roi_preserves_inside_pixels_and_rejects_crossing_masks(self):
+        roi = RUNTIME.MatROI(dict(frame_size_wh=[20,20], points_px=[[3,3],[17,3],[17,17],[3,17]]))
+        frame = np.zeros((20,20,3),np.uint8)
+        frame[:,:] = [0,255,0]
+        masked = roi.apply(frame)
+        np.testing.assert_array_equal(masked[10,10],[0,255,0])
+        np.testing.assert_array_equal(masked[0,0],[114,114,114])
+        np.testing.assert_array_equal(frame[0,0],[0,255,0])  # Original is not mutated.
+        inside = dict(object_(box=(7,7,13,13)),color='GREEN',center_inside_mask=True)
+        crossing = dict(object_(box=(2,7,12,13)),color='RED',center_inside_mask=True)
+        edge = dict(object_(box=(3,7,13,13)),color='YELLOW',center_inside_mask=True)
+        self.assertEqual(roi.filter([crossing,edge,inside]),[inside])
+        with self.assertRaisesRegex(ValueError,'Resolusi'):
+            roi.apply(np.zeros((40,40,3),np.uint8))
+        with self.assertRaises(ValueError):
+            RUNTIME.MatROI(dict(frame_size_wh=[20,20],points_px=[[3,3],[17,17],[17,3],[3,17]]))
+
+    def test_missing_roi_never_silently_runs_full_frame(self):
+        with patch('sys.argv',['runtime']), patch.object(RUNTIME,'ColorModel') as model, \
+             redirect_stderr(io.StringIO()) as error:
+            with self.assertRaises(SystemExit) as caught:
+                RUNTIME.main()
+        self.assertEqual(caught.exception.code,2)
+        model.assert_not_called()
+        self.assertIn('Batas matras belum diisi',error.getvalue())
+
+    def test_xy_serialization_uses_millimeters_and_correct_color_flags(self):
+        for color, flags in [('GREEN',[1,0,0]),('RED',[0,1,0]),('YELLOW',[0,0,1])]:
+            detection = dict(color=color,xy_mm=[280.123,299.999],center_px=[10,20],
+                             inside_work_area=True,center_inside_mask=True)
+            line = RUNTIME.xy_line(detection)
+            self.assertTrue(line.endswith('\n'))
+            payload = json.loads(line)
+            self.assertEqual([payload['x'],payload['y']],[280.12,300.])
+            self.assertEqual([payload[k] for k in ['G','R','Y']],flags)
+
+    def test_xy_serialization_never_substitutes_pixels_or_missing_targets(self):
+        base = dict(color='RED',xy_mm=[280.,300.],center_px=[10,20],
+                    inside_work_area=True,center_inside_mask=True)
+        for invalid in [dict(base,xy_mm=None),dict(base,inside_work_area=None),
+                        dict(base,inside_work_area=False),dict(base,center_inside_mask=False),
+                        dict(base,xy_mm=[float('nan'),0]),dict(base,xy_mm=[True,2]),
+                        dict(base,xy_mm=['280',300]),dict(base,color='MAT'),{}]:
+            self.assertIsNone(RUNTIME.xy_line(invalid))
+
+    def test_xy_output_requires_calibration_before_loading_model(self):
+        with patch('sys.argv',['runtime','--output','xy-json']), \
+             patch.object(RUNTIME,'ColorModel') as model, redirect_stderr(io.StringIO()) as error:
+            with self.assertRaises(SystemExit) as caught:
+                RUNTIME.main()
+        self.assertEqual(caught.exception.code,2)
+        model.assert_not_called()
+        self.assertIn('memerlukan --calibration',error.getvalue())
 
     def test_runtime_sidecar_hash_confidence_and_actual_decode(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -237,6 +557,8 @@ class NotebookTests(unittest.TestCase):
                          MERGE_MANIFEST={'sources':[dict(source_id='source_01', zip_name='old.zip',
                              sha256='fixture', id_remap={0:0,1:1,2:2}, attribution={})]},
                          ZIP_PATH=root/'dataset.zip', IMGSZ=512, CONF=.6, VALIDATION={}, ONNX_QUALITY={},
+                         TRAIN_ARGS=dict(imgsz=640,mask_ratio=2),
+                         RUNTIME_INFERENCE=dict(mode='small',tile_size=640,fine_tile_size=384,overlap=.35,max_passes=64),
                          datetime=datetime, timezone=timezone, shutil=shutil, hashlib=hashlib, json=json,
                          Path=Path, display=lambda *args:None, print=lambda *args:None)
             fake_ipython = types.SimpleNamespace(display=types.SimpleNamespace(FileLink=lambda path:path))

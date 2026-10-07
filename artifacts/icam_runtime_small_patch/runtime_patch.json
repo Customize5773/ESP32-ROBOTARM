@@ -1,0 +1,12 @@
+{
+  "source_notebook": "Train_arm_yolo1.ipynb",
+  "notebook_sha256": "a3bdc6986816849d89829792464846d1a67743f3ff70d584533b791b5a0f978e",
+  "contains_model_weights": false,
+  "default_with_roi": "runtime_config.inference, fallback roi-crop",
+  "optional_modes": [
+    "tiled",
+    "small"
+  ],
+  "coordinates": "original_camera_pixels; XY mm only with measured calibration",
+  "motor_transport_enabled": false
+}

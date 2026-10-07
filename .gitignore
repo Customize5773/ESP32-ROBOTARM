@@ -8,3 +8,8 @@ BCN3D-Moveo
 __pycache__/
 arm-warna-3.v5i.yolov11.zip
 arm_pasti_3_new.v1i.yolov11.zip
+artifacts/icam_runtime_far_patch.zip
+
+.gitignore
+photos4_icam.tar.zip
+artifacts/icam_runtime_small_patch.zip
